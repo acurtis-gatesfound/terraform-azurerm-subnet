@@ -1,0 +1,175 @@
+name: Create Release and Tag
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+permissions:
+  contents: write  # Ensure the token has write permissions for contents
+
+jobs:
+  create_release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Fetch all tags
+        run: git fetch --tags
+
+      - name: Get the latest tag
+        id: get_latest_tag
+        run: |
+          latest_tag=$(git describe --tags `git rev-list --tags --max-count=1` || echo "")
+          echo "tag=$latest_tag" >> $GITHUB_OUTPUT
+
+      - name: Extract version numbers
+        id: extract_version
+        run: |
+          latest_tag=${{ steps.get_latest_tag.outputs.tag }}
+          if [ -z "$latest_tag" ]; then
+            echo "major=0" >> $GITHUB_OUTPUT
+            echo "minor=0" >> $GITHUB_OUTPUT
+            echo "patch=0" >> $GITHUB_OUTPUT
+          else
+            IFS='.' read -r -a version_parts <<< "${latest_tag#v}"
+            echo "major=${version_parts[0]}" >> $GITHUB_OUTPUT
+            echo "minor=${version_parts[1]}" >> $GITHUB_OUTPUT
+            echo "patch=${version_parts[2]}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get pull request title and description
+        id: get_pr_info
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (pr) {
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number
+              });
+              return JSON.stringify({ title: data.title, body: data.body });
+            } else {
+              return JSON.stringify({ title: "", body: "" });
+            }
+          result-encoding: string
+
+      - name: Determine new version
+        id: determine_version
+        run: |
+          pr_info='${{ steps.get_pr_info.outputs.result }}'
+          pr_title=$(echo $pr_info | jq -r '.title')
+          major=${{ steps.extract_version.outputs.major }}
+          minor=${{ steps.extract_version.outputs.minor }}
+          patch=${{ steps.extract_version.outputs.patch }}
+
+          if [ "$major" -eq 0 ] && [ "$minor" -eq 0 ] && [ "$patch" -eq 0 ]; then
+            new_tag="v0.1.0"
+          else
+            case "$pr_title" in
+              fix:*)
+                patch=$((patch + 1))
+                ;;
+              feature:*)
+                minor=$((minor + 1))
+                patch=0
+                ;;
+              version:*)
+                major=$((major + 1))
+                minor=0
+                patch=0
+                ;;
+              *)
+                echo "PR title does not match expected format. Valid prefixes are: fix, feature, version."
+                exit 1
+                ;;
+            esac
+
+            new_tag="v$major.$minor.$patch"
+          fi
+
+          # Check if the tag already exists and increment the version if necessary
+          while git rev-parse "$new_tag" >/dev/null 2>&1; do
+            IFS='.' read -r -a version_parts <<< "${new_tag#v}"
+            major=${version_parts[0]}
+            minor=${version_parts[1]}
+            patch=${version_parts[2]}
+            patch=$((patch + 1))
+            new_tag="v$major.$minor.$patch"
+          done
+
+          echo "new_tag=$new_tag" >> $GITHUB_OUTPUT
+
+      - name: Get previous release notes
+        id: get_previous_release_notes
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const releases = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 1,
+              page: 1
+            });
+            let notes = "";
+            if (releases.data.length > 0) {
+              const latestRelease = releases.data[0];
+              notes = `## ${latestRelease.tag_name}\n${latestRelease.body}\n\n`;
+            }
+            return notes;
+          result-encoding: string
+
+      - name: Create new tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          new_tag=${{ steps.determine_version.outputs.new_tag }}
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git tag $new_tag
+          git push origin $new_tag
+
+      - name: Create or Update GitHub release
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const newTag = '${{ steps.determine_version.outputs.new_tag }}';
+            const prInfo = JSON.parse('${{ steps.get_pr_info.outputs.result }}');
+            const previousNotes = `${{ steps.get_previous_release_notes.outputs.result }}`;
+
+            // Check if the release notes for the new tag already exist
+            const existingRelease = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: newTag
+            }).catch(() => null);
+
+            if (existingRelease) {
+              // Update the existing release with new PR info
+              await github.rest.repos.updateRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: existingRelease.data.id,
+                body: `${existingRelease.data.body}\n\n${prInfo.body}`
+              });
+            } else {
+              // Create a new release
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: newTag,
+                name: newTag,
+                body: `${prInfo.body}\n\n## Previous Releases\n${previousNotes}`,
+                draft: false,
+                prerelease: false
+              });
+            }
+          result-encoding: string
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
